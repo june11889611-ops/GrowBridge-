@@ -357,6 +357,8 @@ def run_agent(api_messages, client, max_steps: int = MAX_AGENT_STEPS):
                 args = json.loads(tc.function.arguments or "{}")
             except Exception:
                 args = {}
+            if not isinstance(args, dict):
+                args = {}
             func = TOOL_IMPL.get(name)
             result = func(**args) if func else f"알 수 없는 도구: {name}"
             tool_log.append({"name": name, "args": args, "result": result})
