@@ -15,6 +15,8 @@ GrowBridge — 내 연구·관심사를 산업과 잇는 주간 논문 큐레이
 import os
 import json
 import datetime
+import random
+import string
 import streamlit as st
 from openai import OpenAI
 
@@ -29,7 +31,36 @@ st.set_page_config(
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-MAX_AGENT_STEPS = 5
+MAX_AGENT_STEPS = 6  # 딥다이브(멀티스텝)를 위해 여유를 둠
+
+# ---- 영속 저장(프로필 코드 방식) --------------------------------------------
+# 관심사·읽을목록을 짧은 코드에 묶어 JSON 파일에 보관한다.
+# Community Cloud에서 컨테이너가 재시작되면 파일이 사라질 수 있으나,
+# 같은 앱 세션 동안의 새로고침/재방문에는 코드로 복원된다.
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gb_data")
+PROFILE_FILE = os.path.join(DATA_DIR, "profiles.json")
+
+
+def _load_all_profiles() -> dict:
+    try:
+        with open(PROFILE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_all_profiles(data: dict) -> bool:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(PROFILE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def _new_code(n: int = 6) -> str:
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=n))
 
 
 def get_api_key() -> str:
@@ -132,11 +163,45 @@ def web_search(query: str, max_results: int = 4) -> str:
         return f"[웹 검색을 사용할 수 없어 모델 지식으로 답변합니다. 사유: {e}]"
 
 
+def save_profile() -> str:
+    """현재 관심사·읽을목록을 짧은 코드로 저장한다(재방문 시 복원용)."""
+    code = st.session_state.get("profile_code") or _new_code()
+    data = _load_all_profiles()
+    data[code] = {
+        "research_focus": st.session_state.get("research_focus"),
+        "reading_list": st.session_state.get("reading_list", []),
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    ok = _save_all_profiles(data)
+    st.session_state.profile_code = code
+    if ok:
+        return f"프로필 저장 완료. 다음에 이 코드로 복원하세요 → 프로필 코드: {code}"
+    return f"프로필을 임시 저장했습니다(코드: {code}). 단, 서버 재시작 시 사라질 수 있습니다."
+
+
+def load_profile(code: str) -> str:
+    """프로필 코드로 관심사·읽을목록을 복원한다."""
+    code = (code or "").strip().upper()
+    data = _load_all_profiles()
+    prof = data.get(code)
+    if not prof:
+        return f"코드 '{code}'에 해당하는 프로필을 찾을 수 없습니다. 코드를 확인해 주세요."
+    st.session_state.research_focus = prof.get("research_focus")
+    st.session_state.reading_list = prof.get("reading_list", [])
+    st.session_state.profile_code = code
+    rf = st.session_state.research_focus
+    field = rf["field"] if rf else "미설정"
+    return (f"프로필 복원 완료(코드 {code}) — 관심 분야: {field}, "
+            f"읽을 논문 {len(st.session_state.reading_list)}건.")
+
+
 TOOL_IMPL = {
     "find_recent_papers": find_recent_papers,
     "set_research_focus": set_research_focus,
     "save_to_reading_list": save_to_reading_list,
     "web_search": web_search,
+    "save_profile": save_profile,
+    "load_profile": load_profile,
 }
 
 TOOLS = [
@@ -203,6 +268,28 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_profile",
+            "description": "현재 관심 산업·연구와 읽을목록을 짧은 코드로 저장한다. 사용자가 '저장/기억해줘'라고 하거나 관심사·읽을목록이 갱신된 뒤 사용한다.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_profile",
+            "description": "프로필 코드로 이전에 저장한 관심 산업·연구와 읽을목록을 복원한다. 사용자가 코드를 제시하며 '불러와줘/복원'을 요청할 때 사용한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "이전에 발급받은 프로필 코드"},
+                },
+                "required": ["code"],
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = (
@@ -226,7 +313,18 @@ SYSTEM_PROMPT = (
     "5) 사용자가 흥미를 보인 논문은 save_to_reading_list로 저장한다.\n"
     "6) 과장 없이, 실무자가 바로 쓸 수 있게 구체적으로 답한다. 논문 내용을 지어내지 말고 검색된 초록에 근거한다.\n"
     "7) 검색 결과가 입력 분야와 동떨어져 보이면(예: 결과가 '대체'되었다고 표시되면), 무관한 논문을 억지로 추천하지 말고 "
-    "그 사실을 솔직히 알린 뒤 더 구체적인 연구 키워드를 사용자에게 제안한다."
+    "그 사실을 솔직히 알린 뒤 더 구체적인 연구 키워드를 사용자에게 제안한다.\n"
+    "\n"
+    "[딥다이브 모드] 사용자가 특정 논문/주제를 '딥다이브' 또는 '심층 분석' 요청하면, 한 번에 끝내지 말고 "
+    "다음 단계를 스스로 도구를 호출해 순서대로 수행한다:\n"
+    "  (1) 대상 논문의 핵심 기여·방법을 정리한다.\n"
+    "  (2) web_search로 그 기술의 '실제 적용 기업·제품·사례'를 조사한다.\n"
+    "  (3) find_recent_papers로 '후속/경쟁 연구'를 추가로 찾는다.\n"
+    "  (4) 위를 종합해 '연구 → 산업 전환 리포트'(요약 / 산업 적용 / 관련 기업 / 후속연구 / 한 줄 결론)로 정리한다.\n"
+    "  여러 도구를 반드시 복수 회 호출해 근거를 쌓은 뒤 결론을 낸다.\n"
+    "\n"
+    "[프로필 기억] 관심사나 읽을목록이 갱신되면 save_profile로 저장하고 발급된 코드를 사용자에게 알려 준다. "
+    "사용자가 코드를 제시하면 load_profile로 복원한다."
 )
 
 
@@ -285,6 +383,10 @@ if "display" not in st.session_state:
     st.session_state.display = []
 if "api_messages" not in st.session_state:
     st.session_state.api_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+if "profile_code" not in st.session_state:
+    st.session_state.profile_code = None
+if "last_assistant" not in st.session_state:
+    st.session_state.last_assistant = ""
 
 
 # ----------------------------------------------------------------------------
@@ -320,13 +422,34 @@ with st.sidebar:
 
     st.divider()
     weekly = st.button("📚 이번 주 추천 논문 받기", use_container_width=True)
+    deepdive = st.button("🔬 마지막 추천 딥다이브", use_container_width=True,
+                         help="방금 추천한 논문 중 1편을 골라 멀티스텝 심층 분석합니다.")
+
+    st.divider()
+    st.markdown("#### 💾 내 기억(프로필)")
+    if st.session_state.profile_code:
+        st.caption(f"내 프로필 코드: **{st.session_state.profile_code}**")
+    save_profile_btn = st.button("관심사·읽을목록 저장", use_container_width=True)
+    if save_profile_btn:
+        msg = save_profile()
+        st.success(msg)
+    code_in = st.text_input("프로필 코드로 복원", placeholder="예: 7F3KQ2", key="code_input")
+    if st.button("복원하기", use_container_width=True):
+        if code_in.strip():
+            st.success(load_profile(code_in))
+            st.rerun()
+        else:
+            st.warning("복원할 코드를 입력하세요.")
+
+    st.divider()
     if st.button("대화 초기화", use_container_width=True):
         st.session_state.display = []
         st.session_state.api_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         st.session_state.reading_list = []
         st.session_state.research_focus = None
+        st.session_state.last_assistant = ""
         st.rerun()
-    st.caption("도구: arXiv 검색 · 관심사 저장 · 읽을목록 · 웹검색")
+    st.caption("도구: arXiv 검색 · 관심사 저장 · 읽을목록 · 웹검색 · 프로필 기억")
 
 
 # ----------------------------------------------------------------------------
@@ -353,7 +476,7 @@ for turn in st.session_state.display:
                     st.markdown(f"**{t['name']}** `({t['args']})`")
                     st.code(t["result"])
 
-# 입력: 채팅창 또는 '이번 주 추천' 버튼
+# 입력: 채팅창 / '이번 주 추천' / '딥다이브' 버튼
 prompt = st.chat_input("관심 분야나 요청을 입력하세요…")
 if not prompt and weekly:
     rf = st.session_state.research_focus
@@ -364,6 +487,15 @@ if not prompt and weekly:
         prompt = ("이번 주(최근 7일) 주목할 만한 AI/머신러닝 arXiv 신규 논문을 추천하고, "
                   "각 논문을 3줄 요약 + 산업 연결 관점으로 정리해줘. "
                   "내 관심 분야가 무엇인지도 함께 물어봐줘.")
+if not prompt and deepdive:
+    if st.session_state.last_assistant.strip():
+        prompt = ("딥다이브 모드로 진행해줘. 방금 네가 추천한 논문 중 가장 유망한 1편을 골라, "
+                  "① 핵심 정리 → ② web_search로 실제 적용 기업·제품 조사 → "
+                  "③ find_recent_papers로 후속·경쟁 연구 검색 → ④ '연구→산업 전환 리포트'로 종합해줘. "
+                  "여러 도구를 단계적으로 호출해서 근거를 쌓아줘.")
+    else:
+        prompt = ("딥다이브 모드. 먼저 내 관심 분야의 대표 논문 1편을 find_recent_papers로 찾은 뒤, "
+                  "①핵심 ②web_search로 산업 적용 ③후속 연구 ④연구→산업 전환 리포트로 종합해줘.")
 
 if prompt:
     st.session_state.display.append({"role": "user", "text": prompt, "tool_log": []})
@@ -393,4 +525,5 @@ if prompt:
         st.session_state.display.append(
             {"role": "assistant", "text": text, "tool_log": tool_log}
         )
+        st.session_state.last_assistant = text
     st.rerun()
